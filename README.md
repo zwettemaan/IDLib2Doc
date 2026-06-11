@@ -22,7 +22,9 @@ Converts an InDesign library into a document.
 - Auto-arranges assets in rows across A4 pages, adding new pages as needed
 - Default page setup: A4 (210 × 297 mm), 20 mm top margin, 15 mm side margins, 10 mm gutters
 
-The two scripts are complementary: you can use Doc2Lib to build a library from a layout, edit the library, then use Lib2Doc to produce a new document reflecting those changes.
+The two scripts are complementary: you can use Lib2Doc to produce a new document representing a library. Make some changes or additions. Then use Doc2Lib to produce a new library reflecting those changes.
+
+To overwrite the original library make sure to close it first before running the script - you cannot overwrite a library that is open in InDesign.
 
 ## Requirements
 
