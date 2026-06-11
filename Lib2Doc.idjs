@@ -1,0 +1,582 @@
+// Lib2Doc for Adobe InDesign: converts a library into a document with page items.
+// The page items get assigned a script label that matches the library item names
+// Lib2Doc complements Doc2Lib which does the reverse conversion
+// Copyright (c) 2026 Kris Coppieters
+// SPDX-License-Identifier: MIT
+
+// !!!! IMPORTANT !!!
+// The following seemingly unbalanced, loose line closes the Adobe InDesign-generated async wrapper
+// function scope created by the UXPScript runtime and puts us back into global space.
+// For more info, check Kris's research on https://github.com/zwettemaan/InDesignBrot/tree/CRDT_UXP
+});
+
+const SystemPromise = global.Promise;
+let PROMISES_PENDING = {};
+let LAST_PROMISE_UNIQUE_ID = 0;
+
+class Promise {
+    constructor(executor) {
+        this._id = ++LAST_PROMISE_UNIQUE_ID;
+        this._promise = new SystemPromise((resolve, reject) => {
+            executor(
+                value => {
+                    if (this._id in PROMISES_PENDING) {
+                        delete PROMISES_PENDING[this._id];
+                    }
+                    resolve(value);
+                },
+                reason => {
+                    if (this._id in PROMISES_PENDING) {
+                        delete PROMISES_PENDING[this._id];
+                    }
+                    reject(reason);
+                }
+            );
+        });
+
+        PROMISES_PENDING[this._id] = this;
+    }
+
+    then(onFulfilled, onRejected) {
+        return this._promise.then(onFulfilled, onRejected);
+    }
+
+    catch(onRejected) {
+        return this._promise.catch(onRejected);
+    }
+
+    finally(onFinally) {
+        return this._promise.finally(onFinally);
+    }
+
+    static pendingPromises() {
+        let retVal = [];
+        let id;
+
+        for (id in PROMISES_PENDING) {
+            if (Object.prototype.hasOwnProperty.call(PROMISES_PENDING, id)) {
+                retVal.push(PROMISES_PENDING[id]);
+            }
+        }
+
+        return retVal;
+    }
+
+    static resolve(value) {
+        return SystemPromise.resolve(value);
+    }
+
+    static reject(reason) {
+        return SystemPromise.reject(reason);
+    }
+
+    static all(promises) {
+        return SystemPromise.all(promises);
+    }
+
+    static race(promises) {
+        return SystemPromise.race(promises);
+    }
+}
+
+// !!!! IMPORTANT !!!
+// The following seemingly unfinished sync function, matches the signature and overrides the
+// Adobe InDesign-generated async wrapper function scope created by the UXPScript runtime
+// and provides a runtime environment for the UXPScript to execute in where we can 'catch'
+// any pending Promise and let them run to completion before finishing the script.
+// For more info, check Kris's research on https://github.com/zwettemaan/InDesignBrot/tree/CRDT_UXP
+
+// Re-open a function by the same signature as the runtime wrapper, but without an async keyword
+// so we can run everything as a synchronous one-shot
+
+(function(exports, require, module, __filename, __dirname) {
+    global.Promise = Promise;
+
+    var shared = require('./helpers.js');
+
+    // --- Configuration ---
+    var SOURCE_LIBRARY_PATH   = '';        // absolute path to source .indl, or '' to use file picker
+    var TARGET_DOCUMENT_PATH  = '';        // absolute path to output .indd, or '' to use file picker
+    var OVERWRITE_EXISTING_TARGET = false; // set true to silently overwrite an existing target file
+
+    var PAGE_WIDTH_MM        = 210;  // output document page width
+    var PAGE_HEIGHT_MM       = 297;  // output document page height
+    var PAGE_MARGIN_TOP_MM   =  20;  // top and bottom margin
+    var PAGE_MARGIN_LEFT_MM  =  15;  // left and right margin
+    var GUTTER_X_MM          =  10;  // horizontal gap between placed assets
+    var GUTTER_Y_MM          =  10;  // vertical gap between rows
+    // --- End configuration ---
+
+    var getRequireFunction = shared.getRequireFunction;
+    var getUxpFs = shared.getUxpFs;
+    var getInDesignApp = shared.getInDesignApp;
+    var normalizePath = shared.normalizePath;
+    var basename = shared.basename;
+    var dirname = shared.dirname;
+    var replaceExtension = shared.replaceExtension;
+    var ensureAbsolutePath = shared.ensureAbsolutePath;
+    var pathExists = shared.pathExists;
+    var getPathFromEntry = shared.getPathFromEntry;
+    var getDefaultInDesignAssetsFolderEntry = shared.getDefaultInDesignAssetsFolderEntry;
+    var prepareTargetPathForWrite = shared.prepareTargetPathForWrite;
+
+    function deriveDefaultTargetPath(sourcePath) {
+        return replaceExtension(sourcePath, '.indd');
+    }
+
+    function chooseSourceLibraryEntry() {
+        var sourcePath = SOURCE_LIBRARY_PATH ? ensureAbsolutePath(SOURCE_LIBRARY_PATH) : '';
+        var fs = getUxpFs();
+
+        if (sourcePath) {
+            return fs.getEntryWithUrl('file://' + sourcePath);
+        }
+
+        return getDefaultInDesignAssetsFolderEntry().then(function(initialFolder) {
+            return fs.getFileForOpening({
+                types: ['indl'],
+                allowMultiple: false,
+                initialLocation: initialFolder
+            });
+        }).then(function(entry) {
+            if (entry instanceof Array) {
+                return entry.length ? entry[0] : null;
+            }
+
+            return entry;
+        });
+    }
+
+    function chooseTargetDocumentEntry(defaultFileName, sourceEntry, sourcePath) {
+        var targetPath = TARGET_DOCUMENT_PATH ? ensureAbsolutePath(TARGET_DOCUMENT_PATH) : '';
+        var fs = getUxpFs();
+
+        if (targetPath) {
+            return fs.getEntryWithUrl('file://' + targetPath).then(function(entry) {
+                return {
+                    entry: entry,
+                    targetPath: targetPath,
+                    wasChosenInteractively: false
+                };
+            });
+        }
+
+        return fs.getEntryWithUrl('file://' + dirname(sourcePath)).then(function(sourceParent) {
+            if (!sourceParent) {
+                throw new Error('Could not resolve parent folder for selected source library: ' + sourcePath);
+            }
+
+            return fs.getFileForSaving(defaultFileName, {
+                types: ['indd'],
+                initialLocation: sourceParent
+            }).then(function(entry) {
+                return {
+                    entry: entry,
+                    targetPath: getPathFromEntry(entry),
+                    wasChosenInteractively: true
+                };
+            });
+        });
+    }
+
+    function ensurePage(documentRef, pageIndex) {
+        while (documentRef.pages.length <= pageIndex) {
+            documentRef.pages.add();
+        }
+
+        return documentRef.pages.item(pageIndex);
+    }
+
+    function mm(value) {
+        return String(value) + 'mm';
+    }
+
+    function applyDocumentPreferences(documentRef) {
+        var indesign = getRequireFunction()('indesign');
+
+        if (documentRef.viewPreferences) {
+            documentRef.viewPreferences.horizontalMeasurementUnits = 2053991795;
+            documentRef.viewPreferences.verticalMeasurementUnits = 2053991795;
+
+            if (indesign && indesign.RulerOrigin) {
+                documentRef.viewPreferences.rulerOrigin = indesign.RulerOrigin.SPREAD_ORIGIN;
+            }
+        }
+
+        documentRef.documentPreferences.pageWidth = mm(PAGE_WIDTH_MM);
+        documentRef.documentPreferences.pageHeight = mm(PAGE_HEIGHT_MM);
+        documentRef.documentPreferences.facingPages = false;
+    }
+
+    function saveDocument(documentRef, targetPath) {
+        var fs = shared.getFsModule();
+        var firstSaveResult = documentRef.save(targetPath, false);
+
+        return Promise.resolve(firstSaveResult).then(function() {
+            var secondSaveResult = null;
+
+            if (!documentRef.saved) {
+                secondSaveResult = documentRef.save();
+            }
+
+            return Promise.resolve(secondSaveResult);
+        }).then(function() {
+            if (!documentRef.saved) {
+                throw new Error('Document remained modified after save: ' + targetPath);
+            }
+
+            if (!pathExists(targetPath)) {
+                throw new Error('Document save did not create target file: ' + targetPath);
+            }
+
+            if (typeof fs.statSync == 'function') {
+                var stat = fs.statSync(targetPath);
+
+                if (!stat || !stat.size) {
+                    throw new Error('Document save created an empty target file: ' + targetPath);
+                }
+            }
+        });
+    }
+
+    function waitForTrackedConstructionWork() {
+        if (typeof Promise == 'undefined' || !Promise || typeof Promise.pendingPromises != 'function') {
+            return Promise.resolve();
+        }
+
+        var pending = Promise.pendingPromises();
+
+        if (!pending || !pending.length) {
+            return Promise.resolve();
+        }
+
+        return Promise.all(pending).then(function() {
+            var remaining = Promise.pendingPromises();
+
+            if (!remaining || !remaining.length) {
+                return null;
+            }
+
+            if (remaining.length === pending.length) {
+                return null;
+            }
+
+            return waitForTrackedConstructionWork();
+        });
+    }
+
+    function activatePage(page) {
+        var app = getInDesignApp();
+
+        try {
+            if (app && app.layoutWindows && app.layoutWindows.length > 0) {
+                app.layoutWindows.item(0).activePage = page;
+            }
+        }
+        catch (err) {
+        }
+    }
+
+    function getGeometricItemBounds(pageItem) {
+        var bounds = null;
+
+        if (!pageItem) {
+            return null;
+        }
+
+        if (pageItem.geometricBounds && pageItem.geometricBounds.length === 4) {
+            bounds = pageItem.geometricBounds;
+        }
+
+        if (!bounds || bounds.length !== 4) {
+            return null;
+        }
+
+        return [
+            bounds[0],
+            bounds[1],
+            bounds[2],
+            bounds[3]
+        ];
+    }
+
+    function getVisibleItemBounds(pageItem) {
+        var bounds = null;
+
+        if (!pageItem) {
+            return null;
+        }
+
+        if (pageItem.visibleBounds && pageItem.visibleBounds.length === 4) {
+            bounds = pageItem.visibleBounds;
+        } else {
+            bounds = getGeometricItemBounds(pageItem);
+        }
+
+        if (!bounds || bounds.length !== 4) {
+            return null;
+        }
+
+        return [
+            bounds[0],
+            bounds[1],
+            bounds[2],
+            bounds[3]
+        ];
+    }
+
+    function getItemSize(pageItem) {
+        var bounds = getVisibleItemBounds(pageItem);
+
+        if (!bounds || bounds.length !== 4) {
+            return null;
+        }
+
+        return {
+            width: bounds[3] - bounds[1],
+            height: bounds[2] - bounds[0]
+        };
+    }
+
+    function normalizePlacedItems(page, placedItems) {
+        var normalizedItems = placedItems;
+
+        if (!(normalizedItems instanceof Array)) {
+            normalizedItems = [normalizedItems];
+        }
+
+        if (normalizedItems.length === 1) {
+            return normalizedItems[0];
+        }
+
+        return page.groups.add(normalizedItems);
+    }
+
+    function translateItemTo(pageItem, top, left) {
+        var geometricBounds = getGeometricItemBounds(pageItem);
+        var visibleBounds = getVisibleItemBounds(pageItem);
+        var width;
+        var height;
+        var visibleOffsetTop;
+        var visibleOffsetLeft;
+
+        if (!geometricBounds || geometricBounds.length !== 4) {
+            throw new Error('Cannot determine geometric bounds for placed item.');
+        }
+
+        if (!visibleBounds || visibleBounds.length !== 4) {
+            throw new Error('Cannot determine visible bounds for placed item.');
+        }
+
+        width = geometricBounds[3] - geometricBounds[1];
+        height = geometricBounds[2] - geometricBounds[0];
+        visibleOffsetTop = visibleBounds[0] - geometricBounds[0];
+        visibleOffsetLeft = visibleBounds[1] - geometricBounds[1];
+
+        pageItem.geometricBounds = [
+            top - visibleOffsetTop,
+            left - visibleOffsetLeft,
+            top - visibleOffsetTop + height,
+            left - visibleOffsetLeft + width
+        ];
+    }
+
+    function arrangeAssetsIntoDocument(libraryRef, documentRef) {
+        var pageIndex = 0;
+        var page = documentRef.pages.item(0);
+        var cursorX = PAGE_MARGIN_LEFT_MM;
+        var cursorY = PAGE_MARGIN_TOP_MM;
+        var rowHeight = 0;
+        var placements = [];
+        var maxContentWidth = PAGE_WIDTH_MM - (PAGE_MARGIN_LEFT_MM * 2);
+        var pageRight = PAGE_WIDTH_MM - PAGE_MARGIN_LEFT_MM;
+        var pageBottom = PAGE_HEIGHT_MM - PAGE_MARGIN_TOP_MM;
+        var assetIndex;
+
+        if (!libraryRef.assets || typeof libraryRef.assets.length != 'number') {
+            throw new Error('Opened source library does not expose assets.');
+        }
+
+        if (libraryRef.assets.length === 0) {
+            throw new Error('Opened source library contains zero assets.');
+        }
+
+        for (assetIndex = 0; assetIndex < libraryRef.assets.length; assetIndex++) {
+            var asset = libraryRef.assets.item(assetIndex);
+            var placedItem;
+            var size;
+            var plannedX;
+            var plannedY;
+            var candidateX;
+            var candidateY;
+            var placed = false;
+            var wrappedToNextRow = false;
+
+            while (!placed) {
+                activatePage(page);
+                placedItem = normalizePlacedItems(page, asset.placeAsset(documentRef));
+
+                if (!placedItem || !placedItem.isValid) {
+                    throw new Error('Failed to place library asset at index ' + assetIndex);
+                }
+
+                placedItem.label = asset.name || '';
+                size = getItemSize(placedItem);
+                if (!size) {
+                    throw new Error('Placed library asset has invalid bounds: ' + (asset.name || assetIndex));
+                }
+
+                candidateX = cursorX;
+                candidateY = cursorY;
+                wrappedToNextRow = false;
+
+                if (candidateX + size.width > pageRight && candidateX > PAGE_MARGIN_LEFT_MM) {
+                    candidateX = PAGE_MARGIN_LEFT_MM;
+                    candidateY = cursorY + rowHeight + GUTTER_Y_MM;
+                    wrappedToNextRow = true;
+                }
+
+                if (candidateY + size.height > pageBottom && candidateY > PAGE_MARGIN_TOP_MM) {
+                    placedItem.remove();
+                    pageIndex++;
+                    page = ensurePage(documentRef, pageIndex);
+                    cursorX = PAGE_MARGIN_LEFT_MM;
+                    cursorY = PAGE_MARGIN_TOP_MM;
+                    rowHeight = 0;
+                    continue;
+                }
+
+                plannedX = candidateX;
+                plannedY = candidateY;
+
+                if (size.width > maxContentWidth) {
+                    plannedX = PAGE_MARGIN_LEFT_MM;
+                }
+
+                if (size.height > (PAGE_HEIGHT_MM - (PAGE_MARGIN_TOP_MM * 2))) {
+                    plannedY = PAGE_MARGIN_TOP_MM;
+                }
+
+                if (wrappedToNextRow) {
+                    cursorX = PAGE_MARGIN_LEFT_MM;
+                    cursorY = plannedY;
+                    rowHeight = 0;
+                }
+
+                translateItemTo(placedItem, plannedY, plannedX);
+                placed = true;
+            }
+
+            var finalBounds = getVisibleItemBounds(placedItem);
+            if (!finalBounds) {
+                throw new Error('Placed library asset has invalid final bounds: ' + (asset.name || assetIndex));
+            }
+
+            placements.push({
+                assetName: asset.name || '',
+                pageIndex: pageIndex,
+                label: placedItem.label || '',
+                bounds: finalBounds
+            });
+
+            cursorX = finalBounds[3] + GUTTER_X_MM;
+            cursorY = plannedY;
+            if ((finalBounds[2] - finalBounds[0]) > rowHeight) {
+                rowHeight = finalBounds[2] - finalBounds[0];
+            }
+        }
+
+        return placements;
+    }
+
+    function findOpenLibraryByPath(app, sourceLibraryPath) {
+        if (!app.libraries || !app.libraries.length) {
+            return null;
+        }
+
+        for (var i = 0; i < app.libraries.length; i++) {
+            var currentLibrary = app.libraries.item(i);
+            var currentPath = currentLibrary && currentLibrary.isValid && currentLibrary.fullName
+                ? normalizePath(String(currentLibrary.fullName))
+                : '';
+
+            if (currentPath && currentPath == sourceLibraryPath) {
+                return currentLibrary;
+            }
+        }
+
+        return null;
+    }
+
+    function run() {
+        var app = getInDesignApp();
+
+        return chooseSourceLibraryEntry().then(function(sourceEntry) {
+            if (!sourceEntry) {
+                throw new Error('No source .indl file was selected.');
+            }
+
+            var sourceLibraryPath = getPathFromEntry(sourceEntry);
+            var suggestedFileName = basename(deriveDefaultTargetPath(sourceLibraryPath));
+
+            return chooseTargetDocumentEntry(suggestedFileName, sourceEntry, sourceLibraryPath).then(function(targetSelection) {
+                if (!targetSelection || !targetSelection.entry) {
+                    throw new Error('No target .indd file was chosen.');
+                }
+
+                var targetDocumentPath = targetSelection.targetPath;
+                var sourceLibrary;
+                var outputDocument;
+                var placements;
+
+                return prepareTargetPathForWrite(targetSelection, OVERWRITE_EXISTING_TARGET).then(function() {
+                    sourceLibrary = findOpenLibraryByPath(app, sourceLibraryPath);
+                    if (!sourceLibrary) {
+                        sourceLibrary = app.open(sourceLibraryPath);
+                    }
+
+                    if (!sourceLibrary || !sourceLibrary.isValid) {
+                        throw new Error('Failed to open source library: ' + sourceLibraryPath);
+                    }
+
+                    outputDocument = app.documents.add();
+                    applyDocumentPreferences(outputDocument);
+                    placements = arrangeAssetsIntoDocument(sourceLibrary, outputDocument);
+
+                    return waitForTrackedConstructionWork().then(function() {
+                        return saveDocument(outputDocument, targetDocumentPath);
+                    }).then(function() {
+                        return {
+                            sourceLibraryPath: sourceLibraryPath,
+                            targetDocumentPath: targetDocumentPath,
+                            placementCount: placements.length
+                        };
+                    });
+                });
+            });
+        });
+    }
+
+    return SystemPromise.resolve(run()).then(function(result) {
+        return SystemPromise.resolve(Promise.all(Promise.pendingPromises())).then(function() {
+            if (typeof console != 'undefined' && console && typeof console.log == 'function') {
+                console.log(JSON.stringify(result, null, 2));
+            }
+
+            return result;
+        });
+    }).catch(function(err) {
+        var message = err && err.stack ? err.stack : String(err);
+
+        if (typeof console != 'undefined' && console && typeof console.error == 'function') {
+            console.error(message);
+        }
+
+        throw err;
+    });
+
+// !!!! IMPORTANT !!!
+// DO NOT balance the brackets and close the function - the internal InDesign runtime wrapper will close it for us.
+// This is a hack where we obliterate the async wrapper function from the runtime and replace it
+// with our own sync wrapper function and leave the runtime inside InDesign none the wiser
+// For more info, check Kris's research on https://github.com/zwettemaan/InDesignBrot/tree/CRDT_UXP
