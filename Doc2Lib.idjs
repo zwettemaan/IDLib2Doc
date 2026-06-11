@@ -11,6 +11,12 @@
 // For more info, check Kris's research on https://github.com/zwettemaan/InDesignBrot/tree/CRDT_UXP
 });
 
+// --- Configuration ---
+var SOURCE_DOCUMENT_PATH = '';         // absolute path to source .indd, or '' to use file picker
+var TARGET_LIBRARY_PATH  = '';         // absolute path to output .indl, or '' to use file picker
+var OVERWRITE_EXISTING_TARGET = false; // set true to silently overwrite an existing target file
+// --- End configuration ---
+
 const SystemPromise = global.Promise;
 let PROMISES_PENDING = {};
 let LAST_PROMISE_UNIQUE_ID = 0;
@@ -94,12 +100,6 @@ class Promise {
     global.Promise = Promise;
 
     var shared = require('./helpers.js');
-
-    // --- Configuration ---
-    var SOURCE_DOCUMENT_PATH = '';         // absolute path to source .indd, or '' to use file picker
-    var TARGET_LIBRARY_PATH  = '';         // absolute path to output .indl, or '' to use file picker
-    var OVERWRITE_EXISTING_TARGET = false; // set true to silently overwrite an existing target file
-    // --- End configuration ---
 
     var getRequireFunction = shared.getRequireFunction;
     var getUxpFs = shared.getUxpFs;
@@ -223,30 +223,6 @@ class Promise {
         });
     }
 
-    function findOpenDocumentByPath(app, sourceDocumentPath) {
-        var documentIndex;
-
-        if (!app || !app.documents || !app.documents.length) {
-            return null;
-        }
-
-        for (documentIndex = 0; documentIndex < app.documents.length; documentIndex++) {
-            var currentDocument = app.documents.item(documentIndex);
-            var currentPath = '';
-
-            if (!currentDocument || !currentDocument.isValid || !currentDocument.fullName) {
-                continue;
-            }
-
-            currentPath = normalizePath(String(currentDocument.fullName));
-            if (currentPath && currentPath == sourceDocumentPath) {
-                return currentDocument;
-            }
-        }
-
-        return null;
-    }
-
     function getLabeledSnippetItems(documentRef) {
         var items = [];
         var seenIds = {};
@@ -344,6 +320,7 @@ class Promise {
 
     function run() {
         var app = getInDesignApp();
+        var documentCountBefore = app.documents.length;
 
         return chooseSourceDocumentEntry().then(function(sourceEntry) {
             if (!sourceEntry) {
@@ -351,13 +328,9 @@ class Promise {
             }
 
             var sourceDocumentPath = getPathFromEntry(sourceEntry);
-            var sourceDocument = findOpenDocumentByPath(app, sourceDocumentPath);
-            var sourceDocumentWasAlreadyOpen = !!sourceDocument;
+            var sourceDocument = openDocumentWithDialogsSuppressed(app, sourceDocumentPath);
+            var sourceDocumentWasAlreadyOpen = (app.documents.length === documentCountBefore);
             var labeledItems = null;
-
-            if (!sourceDocument) {
-                sourceDocument = openDocumentWithDialogsSuppressed(app, sourceDocumentPath);
-            }
 
             if (!sourceDocument || !sourceDocument.isValid) {
                 throw new Error('Failed to open source document: ' + sourceDocumentPath);
@@ -396,12 +369,6 @@ class Promise {
                     for (itemIndex = 0; itemIndex < labeledItems.length; itemIndex++) {
                         storeGroupInLibrary(targetLibrary, labeledItems[itemIndex], labeledItems[itemIndex].label);
                         storedCount++;
-                    }
-
-                    try {
-                        targetLibrary.close();
-                    }
-                    catch (closeErr) {
                     }
 
                     if (!sourceDocumentWasAlreadyOpen) {

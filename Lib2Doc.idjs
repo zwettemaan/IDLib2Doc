@@ -10,6 +10,19 @@
 // For more info, check Kris's research on https://github.com/zwettemaan/InDesignBrot/tree/CRDT_UXP
 });
 
+// --- Configuration ---
+var SOURCE_LIBRARY_PATH   = '';        // absolute path to source .indl, or '' to use file picker
+var TARGET_DOCUMENT_PATH  = '';        // absolute path to output .indd, or '' to use file picker
+var OVERWRITE_EXISTING_TARGET = false; // set true to silently overwrite an existing target file
+
+var PAGE_WIDTH_MM        = 210;  // output document page width
+var PAGE_HEIGHT_MM       = 297;  // output document page height
+var PAGE_MARGIN_TOP_MM   =  20;  // top and bottom margin
+var PAGE_MARGIN_LEFT_MM  =  15;  // left and right margin
+var GUTTER_X_MM          =  10;  // horizontal gap between placed assets
+var GUTTER_Y_MM          =  10;  // vertical gap between rows
+// --- End configuration ---
+
 const SystemPromise = global.Promise;
 let PROMISES_PENDING = {};
 let LAST_PROMISE_UNIQUE_ID = 0;
@@ -93,19 +106,6 @@ class Promise {
     global.Promise = Promise;
 
     var shared = require('./helpers.js');
-
-    // --- Configuration ---
-    var SOURCE_LIBRARY_PATH   = '';        // absolute path to source .indl, or '' to use file picker
-    var TARGET_DOCUMENT_PATH  = '';        // absolute path to output .indd, or '' to use file picker
-    var OVERWRITE_EXISTING_TARGET = false; // set true to silently overwrite an existing target file
-
-    var PAGE_WIDTH_MM        = 210;  // output document page width
-    var PAGE_HEIGHT_MM       = 297;  // output document page height
-    var PAGE_MARGIN_TOP_MM   =  20;  // top and bottom margin
-    var PAGE_MARGIN_LEFT_MM  =  15;  // left and right margin
-    var GUTTER_X_MM          =  10;  // horizontal gap between placed assets
-    var GUTTER_Y_MM          =  10;  // vertical gap between rows
-    // --- End configuration ---
 
     var getRequireFunction = shared.getRequireFunction;
     var getUxpFs = shared.getUxpFs;
@@ -489,27 +489,9 @@ class Promise {
         return placements;
     }
 
-    function findOpenLibraryByPath(app, sourceLibraryPath) {
-        if (!app.libraries || !app.libraries.length) {
-            return null;
-        }
-
-        for (var i = 0; i < app.libraries.length; i++) {
-            var currentLibrary = app.libraries.item(i);
-            var currentPath = currentLibrary && currentLibrary.isValid && currentLibrary.fullName
-                ? normalizePath(String(currentLibrary.fullName))
-                : '';
-
-            if (currentPath && currentPath == sourceLibraryPath) {
-                return currentLibrary;
-            }
-        }
-
-        return null;
-    }
-
     function run() {
         var app = getInDesignApp();
+        var libraryCountBefore = app.libraries ? app.libraries.length : 0;
 
         return chooseSourceLibraryEntry().then(function(sourceEntry) {
             if (!sourceEntry) {
@@ -526,14 +508,13 @@ class Promise {
 
                 var targetDocumentPath = targetSelection.targetPath;
                 var sourceLibrary;
+                var sourceLibraryWasAlreadyOpen;
                 var outputDocument;
                 var placements;
 
                 return prepareTargetPathForWrite(targetSelection, OVERWRITE_EXISTING_TARGET).then(function() {
-                    sourceLibrary = findOpenLibraryByPath(app, sourceLibraryPath);
-                    if (!sourceLibrary) {
-                        sourceLibrary = app.open(sourceLibraryPath);
-                    }
+                    sourceLibrary = app.open(sourceLibraryPath);
+                    sourceLibraryWasAlreadyOpen = (app.libraries.length === libraryCountBefore);
 
                     if (!sourceLibrary || !sourceLibrary.isValid) {
                         throw new Error('Failed to open source library: ' + sourceLibraryPath);
@@ -546,6 +527,14 @@ class Promise {
                     return waitForTrackedConstructionWork().then(function() {
                         return saveDocument(outputDocument, targetDocumentPath);
                     }).then(function() {
+                        if (!sourceLibraryWasAlreadyOpen) {
+                            try {
+                                sourceLibrary.close();
+                            }
+                            catch (closeLibErr) {
+                            }
+                        }
+
                         return {
                             sourceLibraryPath: sourceLibraryPath,
                             targetDocumentPath: targetDocumentPath,
