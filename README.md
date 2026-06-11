@@ -164,4 +164,4 @@ This is an intentional workaround for how the InDesign UXPScript runtime wraps e
 The fix: the `});` at the top closes the runtime's async wrapper, the script then reinstalls a custom synchronous `Promise` class that tracks all pending promises, and re-opens a new synchronous wrapper function using the same signature. The runtime closes that wrapper when the script ends, leaving everything inside running synchronously with full promise-drain support.
 
 For the full research and explanation behind this technique, see:  
-https://github.com/zwettemaan/InDesignBrot/tree/CRDT_UXP
+https://coppieters.nz/injecting-uxpscript-wrapper/
